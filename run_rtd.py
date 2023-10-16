@@ -1,6 +1,8 @@
+from dataclasses import dataclass, field
 import math
 import os
 import shutil
+from typing import Optional
 
 from datasets import load_from_disk
 from accelerate import Accelerator
@@ -12,6 +14,7 @@ from transformers import (
     DebertaV2Config,
     DebertaV2ForMaskedLM,
     DebertaV2ForTokenClassification,
+    HfArgumentParser,
 )
 
 import torch
@@ -21,44 +24,88 @@ import srsly
 from tqdm.auto import tqdm
 
 
+@dataclass
 class TrainArgs:
-    generator_config = "deberta-v3-xsmall-changed/generator_config.json"
-    generator_weights = "deberta-v3-xsmall-changed/pytorch_model.generator.bin"
-    discriminator_config = "deberta-v3-xsmall-changed/config.json"
-    discriminator_weights = "deberta-v3-xsmall-changed/pytorch_model.bin"
-    per_device_train_batch_size: int = 1
-    temperature: float = 1.0
-    rtd_lambda: float = 20.0
-    tokenizer_name: str = "debertinha-v2-tokenizer"
-    learning_rate: float = 5e-5
-    mixed_precision: str = "no"
-    weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 1
-    num_warmup_steps: int = 10_000
-    lr_scheduler_type: str = "linear"
-    num_train_epochs: int = 1
-    cpu: bool = False
-    log_with: str = "tensorboard"
-    project_dir: str = "debertinha-v2-accelerate"
-    max_train_steps: int = None
-    checkpointing_steps: int = 10
-    output_dir: str = "debertinha-v2-checkpoints"
-    save_total_limit: int = 1
-    max_grad_norm: float = 1.0
-    dataset_path: str = "ds_subset_encoded"
-
-
-targs = TrainArgs()
-
-accelerator = Accelerator(
-    mixed_precision=targs.mixed_precision,
-    gradient_accumulation_steps=targs.gradient_accumulation_steps,
-    cpu=targs.cpu,
-    log_with=targs.log_with,
-    project_dir=targs.project_dir,
-)
-
-tokenizer = AutoTokenizer.from_pretrained(targs.tokenizer_name)
+    generator_config: Optional[str] = field(
+        default="deberta-v3-xsmall-changed/generator_config.json",
+        metadata={"help": "Path to the generator config file."},
+    )
+    generator_weights: Optional[str] = field(
+        default="deberta-v3-xsmall-changed/pytorch_model.generator.bin",
+        metadata={"help": "Path to the generator weights file."},
+    )
+    discriminator_config: Optional[str] = field(
+        default="deberta-v3-xsmall-changed/config.json",
+        metadata={"help": "Path to the discriminator config file."},
+    )
+    discriminator_weights: Optional[str] = field(
+        default="deberta-v3-xsmall-changed/pytorch_model.bin",
+        metadata={"help": "Path to the discriminator weights file."},
+    )
+    per_device_train_batch_size: Optional[int] = field(
+        default=1,
+        metadata={"help": "Batch size per GPU/TPU core/CPU for training."},
+    )
+    temperature: Optional[float] = field(
+        default=1.0, metadata={"help": "Temperature for top-k sampling."}
+    )
+    rtd_lambda: Optional[float] = field(
+        default=20.0, metadata={"help": "Lambda for RTD loss."}
+    )
+    tokenizer_name: Optional[str] = field(
+        default="debertinha-v2-tokenizer",
+        metadata={"help": "Tokenizer name or path"},
+    )
+    learning_rate: Optional[float] = field(
+        default=5e-5, metadata={"help": "Learning rate"}
+    )
+    mixed_precision: Optional[str] = field(
+        default="no", metadata={"help": "Mixed precision training"}
+    )
+    weight_decay: Optional[float] = field(
+        default=0.0, metadata={"help": "Weight decay"}
+    )
+    gradient_accumulation_steps: Optional[int] = field(
+        default=1, metadata={"help": "Gradient accumulation steps"}
+    )
+    num_warmup_steps: Optional[int] = field(
+        default=10_000, metadata={"help": "Number of warmup steps"}
+    )
+    lr_scheduler_type: Optional[str] = field(
+        default="linear", metadata={"help": "LR scheduler type"}
+    )
+    num_train_epochs: Optional[int] = field(
+        default=1, metadata={"help": "Number of training epochs"}
+    )
+    cpu: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to use CPU"}
+    )
+    log_with: Optional[str] = field(
+        default="tensorboard", metadata={"help": "Logging framework"}
+    )
+    project_dir: Optional[str] = field(
+        default="debertinha-v2-accelerate",
+        metadata={"help": "Project directory"},
+    )
+    max_train_steps: Optional[int] = field(
+        default=None, metadata={"help": "Max train steps"}
+    )
+    checkpointing_steps: Optional[int] = field(
+        default=10, metadata={"help": "Checkpointing steps"}
+    )
+    save_total_limit: Optional[int] = field(
+        default=1, metadata={"help": "Save total limit"}
+    )
+    max_grad_norm: Optional[float] = field(
+        default=1.0, metadata={"help": "Max grad norm"}
+    )
+    dataset_path: Optional[str] = field(
+        default="ds_subset_encoded", metadata={"help": "Path to the dataset"}
+    )
+    run_name: Optional[str] = field(
+        default="debertinha-v2-runs",
+        metadata={"help": "Name of the run"},
+    )
 
 
 def get_train_dataloader(targs, tokenizer, dataset):
@@ -73,11 +120,6 @@ def get_train_dataloader(targs, tokenizer, dataset):
         num_workers=os.cpu_count(),
     )
     return train_dataloader
-
-
-dataset = load_from_disk(targs.dataset_path)
-
-train_loader = get_train_dataloader(targs, tokenizer, dataset)
 
 
 def initialize_generator(targs) -> DebertaV2ForMaskedLM:
@@ -136,10 +178,6 @@ def initialize_discriminator(
     return discriminator
 
 
-discriminator = initialize_discriminator(targs)
-generator = initialize_generator(targs)
-
-
 def _set_param(module, param_name, value):
     if hasattr(module, param_name):
         delattr(module, param_name)
@@ -152,10 +190,7 @@ def disentangled_hook(module, *inputs):
     _set_param(d_w_ebd, "weight", g_w_ebd.weight.detach() + d_w_ebd.weight)
 
 
-discriminator.register_forward_pre_hook(disentangled_hook)
-
-
-def get_optimizer_and_scheduler(model):
+def get_optimizer_and_scheduler(model, targs):
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
         {
@@ -199,63 +234,6 @@ def get_optimizer_and_scheduler(model):
     return optimizer, lr_scheduler
 
 
-generator_optimizer, generator_lr_scheduler = get_optimizer_and_scheduler(
-    generator
-)
-(
-    discriminator_optimizer,
-    discriminator_lr_scheduler,
-) = get_optimizer_and_scheduler(discriminator)
-
-(
-    generator,
-    generator_optimizer,
-    generator_lr_scheduler,
-    discriminator,
-    discriminator_optimizer,
-    discriminator_lr_scheduler,
-    train_loader,
-) = accelerator.prepare(
-    generator,
-    generator_optimizer,
-    generator_lr_scheduler,
-    discriminator,
-    discriminator_optimizer,
-    discriminator_lr_scheduler,
-    train_loader,
-)
-
-num_update_steps_per_epoch = math.ceil(
-    len(train_loader) / targs.gradient_accumulation_steps
-)
-targs.num_train_epochs = math.ceil(
-    targs.max_train_steps / num_update_steps_per_epoch
-)
-experiment_config = {
-    "per_device_train_batch_size": targs.per_device_train_batch_size,
-    "temperature": targs.temperature,
-    "rtd_lambda": targs.rtd_lambda,
-    "tokenizer_name": targs.tokenizer_name,
-    "learning_rate": targs.learning_rate,
-    "mixed_precision": targs.mixed_precision,
-    "weight_decay": targs.weight_decay,
-    "gradient_accumulation_steps": targs.gradient_accumulation_steps,
-    "num_warmup_steps": targs.num_warmup_steps,
-    "lr_scheduler_type": targs.lr_scheduler_type,
-    "num_train_epochs": targs.num_train_epochs,
-    "cpu": targs.cpu,
-    "log_with": targs.log_with,
-    "project_dir": targs.project_dir,
-    "max_train_steps": targs.max_train_steps,
-    "checkpointing_steps": targs.checkpointing_steps,
-    "output_dir": targs.output_dir,
-    "save_total_limit": targs.save_total_limit,
-    "max_grad_norm": targs.max_grad_norm,
-    "dataset_path": targs.dataset_path,
-}
-accelerator.init_trackers("mlm_no_trainer", experiment_config)
-
-
 def topk_sampling(logits, topk=1, temp=1):
     top_p = torch.nn.functional.softmax(logits / temp, dim=-1)
     topk = max(1, topk)
@@ -263,148 +241,209 @@ def topk_sampling(logits, topk=1, temp=1):
     return next_tokens, top_p
 
 
-progress_bar = tqdm(
-    range(targs.max_train_steps), disable=not accelerator.is_local_main_process
-)
+if __name__ == "__main__":
+    parser = HfArgumentParser(TrainArgs)
+    targs = parser.parse_args_into_dataclasses()[0]
 
-completed_steps = 0
-saved_states = []
-for epoch in range(0, targs.num_train_epochs):
-    generator.train()
-    discriminator.train()
+    accelerator = Accelerator(
+        mixed_precision=targs.mixed_precision,
+        gradient_accumulation_steps=targs.gradient_accumulation_steps,
+        cpu=targs.cpu,
+        log_with=targs.log_with,
+        project_dir=targs.project_dir,
+    )
 
-    total_generator_loss = 0
-    total_discriminator_loss = 0
-    total_loss = 0
-    active_dataloader = train_loader
+    tokenizer = AutoTokenizer.from_pretrained(targs.tokenizer_name)
 
-    for step, batch in enumerate(active_dataloader):
-        with accelerator.accumulate(generator, discriminator):
-            mlm_labels = batch["labels"]
-            input_ids = batch["input_ids"]
-            attention_mask = batch["attention_mask"]
+    dataset = load_from_disk(targs.dataset_path)
+    dataset = dataset.select(range(100))
 
-            ## GENERATOR STEP
-            gen_outputs = generator(**batch)
-            gen_loss = gen_outputs.loss
-            accelerator.backward(gen_loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(
-                    generator.parameters(), targs.max_grad_norm
+    train_loader = get_train_dataloader(targs, tokenizer, dataset)
+
+    discriminator = initialize_discriminator(targs)
+    generator = initialize_generator(targs)
+
+    discriminator.register_forward_pre_hook(disentangled_hook)
+
+    generator_optimizer, generator_lr_scheduler = get_optimizer_and_scheduler(
+        generator, targs
+    )
+
+    (
+        discriminator_optimizer,
+        discriminator_lr_scheduler,
+    ) = get_optimizer_and_scheduler(discriminator, targs)
+
+    (
+        generator,
+        generator_optimizer,
+        generator_lr_scheduler,
+        discriminator,
+        discriminator_optimizer,
+        discriminator_lr_scheduler,
+        train_loader,
+    ) = accelerator.prepare(
+        generator,
+        generator_optimizer,
+        generator_lr_scheduler,
+        discriminator,
+        discriminator_optimizer,
+        discriminator_lr_scheduler,
+        train_loader,
+    )
+
+    num_update_steps_per_epoch = math.ceil(
+        len(train_loader) / targs.gradient_accumulation_steps
+    )
+    targs.num_train_epochs = math.ceil(
+        targs.max_train_steps / num_update_steps_per_epoch
+    )
+    experiment_config = vars(targs)
+    accelerator.init_trackers(targs.run_name, experiment_config)
+
+    progress_bar = tqdm(
+        range(targs.max_train_steps),
+        disable=not accelerator.is_local_main_process,
+    )
+
+    completed_steps = 0
+    saved_states = []
+    for epoch in range(0, targs.num_train_epochs):
+        generator.train()
+        discriminator.train()
+
+        total_generator_loss = 0
+        total_discriminator_loss = 0
+        total_loss = 0
+        active_dataloader = train_loader
+
+        for step, batch in enumerate(active_dataloader):
+            with accelerator.accumulate(generator, discriminator):
+                mlm_labels = batch["labels"]
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+
+                ## GENERATOR STEP
+                gen_outputs = generator(**batch)
+                gen_loss = gen_outputs.loss
+                accelerator.backward(gen_loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        generator.parameters(), targs.max_grad_norm
+                    )
+
+                generator_optimizer.step()
+                generator_lr_scheduler.step()
+                generator_optimizer.zero_grad()
+
+                total_generator_loss += gen_loss.detach().float()
+                ## GENERATOR STEP
+
+                ## DISCRIMINATOR BATCH
+                gen_logits = gen_outputs.logits
+                gen_logits = gen_logits.view(-1, gen_logits.size(-1))
+                topk_labels, _ = topk_sampling(
+                    gen_logits, topk=1, temp=targs.temperature
                 )
-
-            generator_optimizer.step()
-            generator_lr_scheduler.step()
-            generator_optimizer.zero_grad()
-
-            total_generator_loss += gen_loss.detach().float()
-            ## GENERATOR STEP
-
-            ## DISCRIMINATOR BATCH
-            gen_logits = gen_outputs.logits
-            gen_logits = gen_logits.view(-1, gen_logits.size(-1))
-            topk_labels, _ = topk_sampling(
-                gen_logits, topk=1, temp=targs.temperature
-            )
-            mask_index = (mlm_labels.view(-1) > 0).nonzero().view(-1)
-            top_ids = torch.zeros_like(mlm_labels.view(-1))
-            top_ids.scatter_(
-                index=mask_index.long(),
-                src=topk_labels.view(-1).long(),
-                dim=-1,
-            )
-            top_ids = top_ids.view(mlm_labels.size())
-            new_ids = torch.where(mlm_labels > 0, top_ids, input_ids).detach()
-            disc_batch = {
-                "input_ids": new_ids,
-                "attention_mask": attention_mask,
-            }
-            ## DISCRIMINATOR BATCH
-
-            ## DISCRIMINATOR STEP
-            disc_outputs = discriminator(**disc_batch)
-            disc_logits = disc_outputs.logits
-            mask_logits = disc_logits.view(-1)
-            _input_mask = attention_mask.view(-1).to(mask_logits)
-            input_idx = (_input_mask > 0).nonzero().view(-1)
-            mask_labels = ((mlm_labels > 0) & (mlm_labels != input_ids)).view(
-                -1
-            )
-            mask_labels = torch.gather(
-                mask_labels.to(mask_logits), 0, input_idx
-            )
-            mask_loss_fn = torch.nn.BCEWithLogitsLoss()
-            mask_logits = torch.gather(mask_logits, 0, input_idx).float()
-            disc_loss = targs.rtd_lambda * mask_loss_fn(
-                mask_logits, mask_labels
-            )
-            accelerator.backward(disc_loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(
-                    discriminator.parameters(), targs.max_grad_norm
+                mask_index = (mlm_labels.view(-1) > 0).nonzero().view(-1)
+                top_ids = torch.zeros_like(mlm_labels.view(-1))
+                top_ids.scatter_(
+                    index=mask_index.long(),
+                    src=topk_labels.view(-1).long(),
+                    dim=-1,
                 )
-            discriminator_optimizer.step()
-            discriminator_lr_scheduler.step()
-            discriminator_optimizer.zero_grad()
+                top_ids = top_ids.view(mlm_labels.size())
+                new_ids = torch.where(
+                    mlm_labels > 0, top_ids, input_ids
+                ).detach()
+                disc_batch = {
+                    "input_ids": new_ids,
+                    "attention_mask": attention_mask,
+                }
+                ## DISCRIMINATOR BATCH
 
-            total_discriminator_loss += disc_loss.detach().float()
-            ## DISCRIMINATOR STEP
+                ## DISCRIMINATOR STEP
+                disc_outputs = discriminator(**disc_batch)
+                disc_logits = disc_outputs.logits
+                mask_logits = disc_logits.view(-1)
+                _input_mask = attention_mask.view(-1).to(mask_logits)
+                input_idx = (_input_mask > 0).nonzero().view(-1)
+                mask_labels = (
+                    (mlm_labels > 0) & (mlm_labels != input_ids)
+                ).view(-1)
+                mask_labels = torch.gather(
+                    mask_labels.to(mask_logits), 0, input_idx
+                )
+                mask_loss_fn = torch.nn.BCEWithLogitsLoss()
+                mask_logits = torch.gather(mask_logits, 0, input_idx).float()
+                disc_loss = targs.rtd_lambda * mask_loss_fn(
+                    mask_logits, mask_labels
+                )
+                accelerator.backward(disc_loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        discriminator.parameters(), targs.max_grad_norm
+                    )
+                discriminator_optimizer.step()
+                discriminator_lr_scheduler.step()
+                discriminator_optimizer.zero_grad()
 
-            total_loss += (gen_loss + disc_loss).detach().float()
+                total_discriminator_loss += disc_loss.detach().float()
+                ## DISCRIMINATOR STEP
 
-        # Checks if the accelerator has performed an optimization step behind the scenes
-        if accelerator.sync_gradients:
-            progress_bar.update(1)
-            completed_steps += 1
+                total_loss += (gen_loss + disc_loss).detach().float()
 
-        if completed_steps % targs.checkpointing_steps == 0:
-            output_dir = f"step_{completed_steps}"
-            if targs.output_dir is not None:
-                output_dir = os.path.join(targs.output_dir, output_dir)
-            accelerator.save_state(output_dir)
-            saved_states.append(output_dir)
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                completed_steps += 1
 
-            # remove old states directory
-            if len(saved_states) > targs.save_total_limit:
-                old_state = saved_states.pop(0)
-                shutil.rmtree(old_state)
+            if completed_steps % targs.checkpointing_steps == 0:
+                output_dir = f"step_{completed_steps}"
+                output_dir = os.path.join(targs.project_dir, output_dir)
+                accelerator.save_state(output_dir)
+                saved_states.append(output_dir)
 
-        if completed_steps % 100 == 0:
-            accelerator.log(
-                {
-                    "train_loss": total_loss.item() / 100,
-                    "discriminator_loss": total_discriminator_loss.item()
-                    / 100,
-                    "generator_loss": total_generator_loss.item() / 100,
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
-            total_generator_loss = 0
-            total_discriminator_loss = 0
-            total_loss = 0
+                # remove old states directory
+                if len(saved_states) > targs.save_total_limit:
+                    old_state = saved_states.pop(0)
+                    shutil.rmtree(old_state)
 
-        if completed_steps >= targs.max_train_steps:
-            break
+            if completed_steps % 100 == 0:
+                accelerator.log(
+                    {
+                        "train_loss": total_loss.item() / 100,
+                        "discriminator_loss": total_discriminator_loss.item()
+                        / 100,
+                        "generator_loss": total_generator_loss.item() / 100,
+                        "epoch": epoch,
+                        "step": completed_steps,
+                    },
+                    step=completed_steps,
+                )
+                total_generator_loss = 0
+                total_discriminator_loss = 0
+                total_loss = 0
 
-    output_dir = f"epoch_{epoch}"
-    if targs.output_dir is not None:
-        output_dir = os.path.join(targs.output_dir, output_dir)
-    accelerator.save_state(output_dir)
+            if completed_steps >= targs.max_train_steps:
+                break
 
-accelerator.end_training()
+        output_dir = f"epoch_{epoch}"
+        output_dir = os.path.join(targs.project_dir, output_dir)
+        accelerator.save_state(output_dir)
 
-accelerator.wait_for_everyone()
-unwrapped_model = accelerator.unwrap_model(generator)
-unwrapped_model.save_pretrained(
-    "generator_final",
-    is_main_process=accelerator.is_main_process,
-    save_function=accelerator.save,
-)
-unwrapped_model = accelerator.unwrap_model(discriminator)
-unwrapped_model.save_pretrained(
-    "discriminator_final",
-    is_main_process=accelerator.is_main_process,
-    save_function=accelerator.save,
-)
+    accelerator.end_training()
+
+    accelerator.wait_for_everyone()
+    unwrapped_model = accelerator.unwrap_model(generator)
+    unwrapped_model.save_pretrained(
+        os.path.join(targs.project_dir, "generator_pretrained"),
+        is_main_process=accelerator.is_main_process,
+        save_function=accelerator.save,
+    )
+    unwrapped_model = accelerator.unwrap_model(discriminator)
+    unwrapped_model.save_pretrained(
+        os.path.join(targs.project_dir, "discriminator_pretrained"),
+        is_main_process=accelerator.is_main_process,
+        save_function=accelerator.save,
+    )
