@@ -76,7 +76,6 @@ def get_train_dataloader(targs, tokenizer, dataset):
 
 
 dataset = load_from_disk(targs.dataset_path)
-dataset = dataset.select(range(100))
 
 train_loader = get_train_dataloader(targs, tokenizer, dataset)
 
@@ -326,13 +325,13 @@ for epoch in range(0, targs.num_train_epochs):
             disc_outputs = discriminator(**disc_batch)
             disc_logits = disc_outputs.logits
             mask_logits = disc_logits.view(-1)
-            _input_mask = attention_mask.view(-1).to(accelerator.device)
+            _input_mask = attention_mask.view(-1).to(mask_logits)
             input_idx = (_input_mask > 0).nonzero().view(-1)
             mask_labels = ((mlm_labels > 0) & (mlm_labels != input_ids)).view(
                 -1
             )
             mask_labels = torch.gather(
-                mask_labels.to(accelerator.device), 0, input_idx
+                mask_labels.to(mask_logits), 0, input_idx
             )
             mask_loss_fn = torch.nn.BCEWithLogitsLoss()
             mask_logits = torch.gather(mask_logits, 0, input_idx).float()
