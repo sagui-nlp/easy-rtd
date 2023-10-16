@@ -1,4 +1,3 @@
-# %%
 import math
 import os
 import shutil
@@ -9,16 +8,24 @@ from accelerate import Accelerator
 from transformers import AutoTokenizer
 from transformers import DataCollatorForLanguageModeling
 from transformers import get_scheduler
+from transformers import (
+    DebertaV2Config,
+    DebertaV2ForMaskedLM,
+    DebertaV2ForTokenClassification,
+)
 
 import torch
 from torch.utils.data import DataLoader
 
+import srsly
 from tqdm.auto import tqdm
 
-from models import initialize_discriminator, initialize_generator, ModelPaths
 
-
-class TrainArgs(ModelPaths):
+class TrainArgs:
+    generator_config = "deberta-v3-xsmall-changed/generator_config.json"
+    generator_weights = "deberta-v3-xsmall-changed/pytorch_model.generator.bin"
+    discriminator_config = "deberta-v3-xsmall-changed/config.json"
+    discriminator_weights = "deberta-v3-xsmall-changed/pytorch_model.bin"
     per_device_train_batch_size: int = 1
     temperature: float = 1.0
     rtd_lambda: float = 20.0
@@ -43,6 +50,14 @@ class TrainArgs(ModelPaths):
 
 targs = TrainArgs()
 
+accelerator = Accelerator(
+    mixed_precision=targs.mixed_precision,
+    gradient_accumulation_steps=targs.gradient_accumulation_steps,
+    cpu=targs.cpu,
+    log_with=targs.log_with,
+    project_dir=targs.project_dir,
+)
+
 tokenizer = AutoTokenizer.from_pretrained(targs.tokenizer_name)
 
 
@@ -55,6 +70,7 @@ def get_train_dataloader(targs, tokenizer, dataset):
         shuffle=True,
         collate_fn=data_collator,
         batch_size=targs.per_device_train_batch_size,
+        num_workers=os.cpu_count(),
     )
     return train_dataloader
 
@@ -63,6 +79,63 @@ dataset = load_from_disk(targs.dataset_path)
 dataset = dataset.select(range(100))
 
 train_loader = get_train_dataloader(targs, tokenizer, dataset)
+
+
+def initialize_generator(targs) -> DebertaV2ForMaskedLM:
+    generator_config = DebertaV2Config(
+        **srsly.read_json(targs.generator_config)
+    )
+    generator = DebertaV2ForMaskedLM(generator_config)
+
+    generator_weights = torch.load(
+        targs.generator_weights, map_location=torch.device("cpu")
+    )
+
+    delete_keys = [
+        "deberta.embeddings.word_embeddings.weight",  # because we use a different vocab
+        "deberta.embeddings.position_embeddings.weight",
+        "lm_predictions.lm_head.bias",
+    ]
+    for key in delete_keys:
+        del generator_weights[key]
+
+    rename_keys = {
+        "lm_predictions.lm_head.dense.weight": "cls.predictions.transform.dense.weight",
+        "lm_predictions.lm_head.dense.bias": "cls.predictions.transform.dense.bias",
+        "lm_predictions.lm_head.LayerNorm.weight": "cls.predictions.transform.LayerNorm.weight",
+        "lm_predictions.lm_head.LayerNorm.bias": "cls.predictions.transform.LayerNorm.bias",
+    }
+    for old_key, new_key in rename_keys.items():
+        generator_weights[new_key] = generator_weights.pop(old_key)
+
+    print(generator.load_state_dict(generator_weights, strict=False))
+
+    return generator
+
+
+def initialize_discriminator(
+    targs,
+) -> DebertaV2ForTokenClassification:
+    discriminator_config = DebertaV2Config(
+        **srsly.read_json(targs.discriminator_config)
+    )
+    discriminator_config.num_labels = 1
+    discriminator = DebertaV2ForTokenClassification(discriminator_config)
+
+    discriminator_weights = torch.load(
+        targs.discriminator_weights, map_location=torch.device("cpu")
+    )
+
+    delete_keys = [
+        "deberta.embeddings.word_embeddings.weight",  # because we use a different vocab
+    ]
+    for key in delete_keys:
+        del discriminator_weights[key]
+
+    print(discriminator.load_state_dict(discriminator_weights, strict=False))
+
+    return discriminator
+
 
 discriminator = initialize_discriminator(targs)
 generator = initialize_generator(targs)
@@ -134,14 +207,6 @@ generator_optimizer, generator_lr_scheduler = get_optimizer_and_scheduler(
     discriminator_optimizer,
     discriminator_lr_scheduler,
 ) = get_optimizer_and_scheduler(discriminator)
-
-accelerator = Accelerator(
-    mixed_precision=targs.mixed_precision,
-    gradient_accumulation_steps=targs.gradient_accumulation_steps,
-    cpu=targs.cpu,
-    log_with=targs.log_with,
-    project_dir=targs.project_dir,
-)
 
 (
     generator,
@@ -261,13 +326,13 @@ for epoch in range(0, targs.num_train_epochs):
             disc_outputs = discriminator(**disc_batch)
             disc_logits = disc_outputs.logits
             mask_logits = disc_logits.view(-1)
-            _input_mask = attention_mask.view(-1).to(mask_logits)
+            _input_mask = attention_mask.view(-1).to(accelerator.device)
             input_idx = (_input_mask > 0).nonzero().view(-1)
             mask_labels = ((mlm_labels > 0) & (mlm_labels != input_ids)).view(
                 -1
             )
             mask_labels = torch.gather(
-                mask_labels.to(mask_logits), 0, input_idx
+                mask_labels.to(accelerator.device), 0, input_idx
             )
             mask_loss_fn = torch.nn.BCEWithLogitsLoss()
             mask_logits = torch.gather(mask_logits, 0, input_idx).float()
