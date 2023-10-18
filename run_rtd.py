@@ -256,7 +256,6 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(targs.tokenizer_name)
 
     dataset = load_from_disk(targs.dataset_path)
-    dataset = dataset.select(range(100))
 
     train_loader = get_train_dataloader(targs, tokenizer, dataset)
 
