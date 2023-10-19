@@ -100,7 +100,7 @@ class TrainArgs:
         default=1.0, metadata={"help": "Max grad norm"}
     )
     dataset_paths: Optional[str] = field(
-        default_factory="brwac_encoded_firsthalf,brwac_encoded_secondhalf,mc4pt_subset_encoded",
+        default="brwac_encoded_firsthalf,brwac_encoded_secondhalf,mc4pt_subset_encoded",
         metadata={"help": "Path to the dataset"}
     )
     run_name: Optional[str] = field(
