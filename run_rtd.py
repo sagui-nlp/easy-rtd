@@ -99,12 +99,8 @@ class TrainArgs:
     max_grad_norm: Optional[float] = field(
         default=1.0, metadata={"help": "Max grad norm"}
     )
-    dataset_paths: Optional[list] = field(
-        default_factory=lambda: [
-            "brwac_encoded_firsthalf",
-            "brwac_encoded_secondhalf",
-            "mc4pt_subset_encoded"
-        ],
+    dataset_paths: Optional[str] = field(
+        default_factory="brwac_encoded_firsthalf,brwac_encoded_secondhalf,mc4pt_subset_encoded",
         metadata={"help": "Path to the dataset"}
     )
     run_name: Optional[str] = field(
@@ -332,7 +328,7 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(targs.tokenizer_name)
 
-    dataset = concatenate_datasets([load_from_disk(dspath) for dspath in targs.dataset_paths])
+    dataset = concatenate_datasets([load_from_disk(dspath) for dspath in targs.dataset_paths.split(",")])
 
     train_loader = get_train_dataloader(targs, tokenizer, dataset)
 
@@ -375,7 +371,6 @@ if __name__ == "__main__":
         targs.max_train_steps / num_update_steps_per_epoch
     )
     experiment_config = vars(targs)
-    targs.dataset_paths = ",".join(targs.dataset_paths)
     accelerator.init_trackers(targs.run_name, experiment_config)
 
     progress_bar = tqdm(
