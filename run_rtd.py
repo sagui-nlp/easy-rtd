@@ -241,6 +241,78 @@ def topk_sampling(logits, topk=1, temp=1):
     return next_tokens, top_p
 
 
+def generator_step(generator, generator_optimizer, generator_lr_scheduler, accelerator, batch, targs):
+    gen_outputs = generator(**batch)
+    gen_loss = gen_outputs.loss
+    accelerator.backward(gen_loss)
+    if accelerator.sync_gradients:
+        accelerator.clip_grad_norm_(
+            generator.parameters(), targs.max_grad_norm
+        )
+
+    generator_optimizer.step()
+    generator_lr_scheduler.step()
+    generator_optimizer.zero_grad()
+
+    return gen_loss.cpu().detach().float(), gen_outputs.logits
+
+def discriminator_batch(gen_logits, batch, targs):
+    mlm_labels = batch.pop("labels")
+    input_ids = batch.pop("input_ids")
+
+    gen_logits = gen_logits.view(-1, gen_logits.size(-1))
+    topk_labels, _ = topk_sampling(
+        gen_logits, topk=1, temp=targs.temperature
+    )
+    mask_index = (mlm_labels.view(-1) > 0).nonzero().view(-1)
+    top_ids = torch.zeros_like(mlm_labels.view(-1))
+    top_ids.scatter_(
+        index=mask_index.long(),
+        src=topk_labels.view(-1).long(),
+        dim=-1,
+    )
+    top_ids = top_ids.view(mlm_labels.size())
+    new_ids = torch.where(
+        mlm_labels > 0, top_ids, input_ids
+    ).detach()
+    return {
+        "input_ids": new_ids,
+        "labels": mlm_labels,
+        "attention_mask": batch.pop("attention_mask"),
+    }
+
+def discriminator_step(discriminator, discriminator_optimizer, discriminator_lr_scheduler, accelerator, batch, targs):
+    mlm_labels = batch.pop("labels")
+    disc_outputs = discriminator(**batch)
+
+    mask_logits = disc_outputs.logits.view(-1)
+    _input_mask = batch.pop("attention_mask")
+    _input_mask = _input_mask.view(-1).to(mask_logits)
+    input_ids = batch.pop("input_ids")
+
+    input_idx = (_input_mask > 0).nonzero().view(-1)
+    mask_labels = (
+        (mlm_labels > 0) & (mlm_labels != input_ids)
+    ).view(-1)
+    mask_labels = torch.gather(
+        mask_labels.to(mask_logits), 0, input_idx
+    )
+    mask_loss_fn = torch.nn.BCEWithLogitsLoss()
+    mask_logits = torch.gather(mask_logits, 0, input_idx).float()
+    disc_loss = targs.rtd_lambda * mask_loss_fn(
+        mask_logits, mask_labels
+    )
+    accelerator.backward(disc_loss)
+    if accelerator.sync_gradients:
+        accelerator.clip_grad_norm_(
+            discriminator.parameters(), targs.max_grad_norm
+        )
+    discriminator_optimizer.step()
+    discriminator_lr_scheduler.step()
+    discriminator_optimizer.zero_grad()
+
+    return disc_loss.cpu().detach().float()
+
 if __name__ == "__main__":
     parser = HfArgumentParser(TrainArgs)
     targs = parser.parse_args_into_dataclasses()[0]
@@ -318,79 +390,22 @@ if __name__ == "__main__":
 
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(generator, discriminator):
-                mlm_labels = batch["labels"]
-                input_ids = batch["input_ids"]
-                attention_mask = batch["attention_mask"]
-
                 ## GENERATOR STEP
-                gen_outputs = generator(**batch)
-                gen_loss = gen_outputs.loss
-                accelerator.backward(gen_loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        generator.parameters(), targs.max_grad_norm
-                    )
-
-                generator_optimizer.step()
-                generator_lr_scheduler.step()
-                generator_optimizer.zero_grad()
-
-                total_generator_loss += gen_loss.detach().float()
+                gen_loss, gen_logits = generator_step(generator, generator_optimizer, generator_lr_scheduler, accelerator, batch, targs)
+                total_generator_loss += gen_loss
                 ## GENERATOR STEP
 
                 ## DISCRIMINATOR BATCH
-                gen_logits = gen_outputs.logits
-                gen_logits = gen_logits.view(-1, gen_logits.size(-1))
-                topk_labels, _ = topk_sampling(
-                    gen_logits, topk=1, temp=targs.temperature
-                )
-                mask_index = (mlm_labels.view(-1) > 0).nonzero().view(-1)
-                top_ids = torch.zeros_like(mlm_labels.view(-1))
-                top_ids.scatter_(
-                    index=mask_index.long(),
-                    src=topk_labels.view(-1).long(),
-                    dim=-1,
-                )
-                top_ids = top_ids.view(mlm_labels.size())
-                new_ids = torch.where(
-                    mlm_labels > 0, top_ids, input_ids
-                ).detach()
-                disc_batch = {
-                    "input_ids": new_ids,
-                    "attention_mask": attention_mask,
-                }
+                batch = discriminator_batch(gen_logits, batch, targs)
+                del gen_logits
                 ## DISCRIMINATOR BATCH
 
                 ## DISCRIMINATOR STEP
-                disc_outputs = discriminator(**disc_batch)
-                disc_logits = disc_outputs.logits
-                mask_logits = disc_logits.view(-1)
-                _input_mask = attention_mask.view(-1).to(mask_logits)
-                input_idx = (_input_mask > 0).nonzero().view(-1)
-                mask_labels = (
-                    (mlm_labels > 0) & (mlm_labels != input_ids)
-                ).view(-1)
-                mask_labels = torch.gather(
-                    mask_labels.to(mask_logits), 0, input_idx
-                )
-                mask_loss_fn = torch.nn.BCEWithLogitsLoss()
-                mask_logits = torch.gather(mask_logits, 0, input_idx).float()
-                disc_loss = targs.rtd_lambda * mask_loss_fn(
-                    mask_logits, mask_labels
-                )
-                accelerator.backward(disc_loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        discriminator.parameters(), targs.max_grad_norm
-                    )
-                discriminator_optimizer.step()
-                discriminator_lr_scheduler.step()
-                discriminator_optimizer.zero_grad()
-
-                total_discriminator_loss += disc_loss.detach().float()
+                disc_loss = discriminator_step(discriminator, discriminator_optimizer, discriminator_lr_scheduler, accelerator, batch, targs)
+                total_discriminator_loss += disc_loss
                 ## DISCRIMINATOR STEP
 
-                total_loss += (gen_loss + disc_loss).detach().float()
+                total_loss += (gen_loss + disc_loss)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
