@@ -4,7 +4,7 @@ import os
 import shutil
 from typing import Optional
 
-from datasets import load_from_disk
+from datasets import load_from_disk, concatenate_datasets
 from accelerate import Accelerator
 
 from transformers import AutoTokenizer
@@ -99,8 +99,13 @@ class TrainArgs:
     max_grad_norm: Optional[float] = field(
         default=1.0, metadata={"help": "Max grad norm"}
     )
-    dataset_path: Optional[str] = field(
-        default="ds_subset_encoded", metadata={"help": "Path to the dataset"}
+    dataset_paths: Optional[list] = field(
+        default_factory=lambda: [
+            "brwac_encoded_firsthalf",
+            "brwac_encoded_secondhalf",
+            "mc4pt_subset_encoded"
+        ],
+        metadata={"help": "Path to the dataset"}
     )
     run_name: Optional[str] = field(
         default="debertinha-v2-runs",
@@ -327,7 +332,7 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(targs.tokenizer_name)
 
-    dataset = load_from_disk(targs.dataset_path)
+    dataset = concatenate_datasets([load_from_disk(dspath) for dspath in targs.dataset_paths])
 
     train_loader = get_train_dataloader(targs, tokenizer, dataset)
 
@@ -370,6 +375,7 @@ if __name__ == "__main__":
         targs.max_train_steps / num_update_steps_per_epoch
     )
     experiment_config = vars(targs)
+    targs.dataset_paths = ",".join(targs.dataset_paths)
     accelerator.init_trackers(targs.run_name, experiment_config)
 
     progress_bar = tqdm(
