@@ -107,6 +107,14 @@ class TrainArgs:
         default="debertinha-v2-runs",
         metadata={"help": "Name of the run"},
     )
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the saved state to load"}
+    )
+    skip_batches: Optional[int] = field(
+        default=0,
+        metadata={"help": "number of steps to skip from the dataloader"}
+    )
 
 
 def get_train_dataloader(targs, tokenizer, dataset):
@@ -372,6 +380,11 @@ if __name__ == "__main__":
     )
     experiment_config = vars(targs)
     accelerator.init_trackers(targs.run_name, experiment_config)
+
+    if targs.resume_from_checkpoint is not None:
+        accelerator.load_state(targs.resume_from_checkpoint)
+        train_loader = accelerator.skip_first_batches(train_loader, targs.skip_batches)
+        print("LOADED STATE")
 
     progress_bar = tqdm(
         range(targs.max_train_steps),
