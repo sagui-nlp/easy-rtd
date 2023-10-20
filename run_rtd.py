@@ -118,7 +118,7 @@ def get_train_dataloader(targs, tokenizer, dataset):
         shuffle=True,
         collate_fn=data_collator,
         batch_size=targs.per_device_train_batch_size,
-        num_workers=os.cpu_count(),
+        num_workers=1,
     )
     return train_dataloader
 
