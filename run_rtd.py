@@ -100,7 +100,7 @@ class TrainArgs:
         default=1.0, metadata={"help": "Max grad norm"}
     )
     dataset_paths: Optional[str] = field(
-        default="brwac_encoded_firsthalf,brwac_encoded_secondhalf,mc4pt_subset_encoded",
+        default="brwac_encoded_firsthalf,brwac_encoded_secondhalf",
         metadata={"help": "Path to the dataset"}
     )
     run_name: Optional[str] = field(
@@ -114,6 +114,10 @@ class TrainArgs:
     skip_batches: Optional[int] = field(
         default=0,
         metadata={"help": "number of steps to skip from the dataloader"}
+    )
+    delete_keys: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Whether to delete the keys from the generator/discriminator weights"}
     )
 
 
@@ -141,22 +145,23 @@ def initialize_generator(targs) -> DebertaV2ForMaskedLM:
         targs.generator_weights, map_location=torch.device("cpu")
     )
 
-    delete_keys = [
-        "deberta.embeddings.word_embeddings.weight",  # because we use a different vocab
-        "deberta.embeddings.position_embeddings.weight",
-        "lm_predictions.lm_head.bias",
-    ]
-    for key in delete_keys:
-        del generator_weights[key]
+    if targs.delete_keys:
+        delete_keys = [
+            "deberta.embeddings.word_embeddings.weight",  # because we use a different vocab
+            "deberta.embeddings.position_embeddings.weight",
+            "lm_predictions.lm_head.bias",
+        ]
+        for key in delete_keys:
+            del generator_weights[key]
 
-    rename_keys = {
-        "lm_predictions.lm_head.dense.weight": "cls.predictions.transform.dense.weight",
-        "lm_predictions.lm_head.dense.bias": "cls.predictions.transform.dense.bias",
-        "lm_predictions.lm_head.LayerNorm.weight": "cls.predictions.transform.LayerNorm.weight",
-        "lm_predictions.lm_head.LayerNorm.bias": "cls.predictions.transform.LayerNorm.bias",
-    }
-    for old_key, new_key in rename_keys.items():
-        generator_weights[new_key] = generator_weights.pop(old_key)
+        rename_keys = {
+            "lm_predictions.lm_head.dense.weight": "cls.predictions.transform.dense.weight",
+            "lm_predictions.lm_head.dense.bias": "cls.predictions.transform.dense.bias",
+            "lm_predictions.lm_head.LayerNorm.weight": "cls.predictions.transform.LayerNorm.weight",
+            "lm_predictions.lm_head.LayerNorm.bias": "cls.predictions.transform.LayerNorm.bias",
+        }
+        for old_key, new_key in rename_keys.items():
+            generator_weights[new_key] = generator_weights.pop(old_key)
 
     print(generator.load_state_dict(generator_weights, strict=False))
 
@@ -175,12 +180,12 @@ def initialize_discriminator(
     discriminator_weights = torch.load(
         targs.discriminator_weights, map_location=torch.device("cpu")
     )
-
-    delete_keys = [
-        "deberta.embeddings.word_embeddings.weight",  # because we use a different vocab
-    ]
-    for key in delete_keys:
-        del discriminator_weights[key]
+    if targs.delete_keys:
+        delete_keys = [
+            "deberta.embeddings.word_embeddings.weight",  # because we use a different vocab
+        ]
+        for key in delete_keys:
+            del discriminator_weights[key]
 
     print(discriminator.load_state_dict(discriminator_weights, strict=False))
 
