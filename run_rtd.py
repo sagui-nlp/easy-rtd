@@ -60,7 +60,7 @@ class TrainArgs:
         default=5e-5, metadata={"help": "Learning rate"}
     )
     mixed_precision: Optional[str] = field(
-        default="no", metadata={"help": "Mixed precision training"}
+        default="fp16", metadata={"help": "Mixed precision training"}
     )
     weight_decay: Optional[float] = field(
         default=0.0, metadata={"help": "Weight decay"}
