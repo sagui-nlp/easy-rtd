@@ -642,35 +642,36 @@ if __name__ == "__main__":
                 progress_bar.update(1)
                 completed_steps += 1
 
-            if completed_steps % targs.checkpointing_steps == 0:
-                output_dir = f"step_{completed_steps}"
-                output_dir = os.path.join(targs.project_dir, output_dir)
-                accelerator.save_state(output_dir)
-                saved_states.append(output_dir)
+                if completed_steps % targs.checkpointing_steps == 0:
+                    output_dir = f"step_{completed_steps}"
+                    output_dir = os.path.join(targs.project_dir, output_dir)
+                    accelerator.save_state(output_dir)
+                    saved_states.append(output_dir)
 
-                # remove old states directory
-                if len(saved_states) > targs.save_total_limit:
-                    old_state = saved_states.pop(0)
-                    shutil.rmtree(old_state)
+                    # remove old states directory
+                    if len(saved_states) > targs.save_total_limit:
+                        old_state = saved_states.pop(0)
+                        shutil.rmtree(old_state)
 
-            if completed_steps % 100 == 0:
-                accelerator.log(
-                    {
-                        "train_loss": total_loss.item() / 100,
-                        "discriminator_loss": total_discriminator_loss.item()
-                        / 100,
-                        "generator_loss": total_generator_loss.item() / 100,
-                        "epoch": epoch,
-                        "step": completed_steps,
-                    },
-                    step=completed_steps,
-                )
-                total_generator_loss = 0
-                total_discriminator_loss = 0
-                total_loss = 0
+                if completed_steps % 100 == 0:
+                    accelerator.log(
+                        {
+                            "train_loss": total_loss.item() / 100,
+                            "discriminator_loss": total_discriminator_loss.item()
+                            / 100,
+                            "generator_loss": total_generator_loss.item()
+                            / 100,
+                            "epoch": epoch,
+                            "step": completed_steps,
+                        },
+                        step=completed_steps,
+                    )
+                    total_generator_loss = 0
+                    total_discriminator_loss = 0
+                    total_loss = 0
 
-            if completed_steps >= targs.max_train_steps:
-                break
+                if completed_steps >= targs.max_train_steps:
+                    break
 
         output_dir = f"epoch_{epoch}"
         output_dir = os.path.join(targs.project_dir, output_dir)
