@@ -12,7 +12,7 @@ PROJECT_DIR="debertinha-v2-accelerate"
 RUN_NAME="debertinha-v2-runs"
 
 # Dataset
-DATASET_PATH="ds_subset_encoded"
+DATASET_PATHS="ds_subset_encoded"
 
 # Set the training arguments
 TOKENIZER_NAME="debertinha-v2-tokenizer"
@@ -54,5 +54,5 @@ accelerate launch run_rtd.py \
     --checkpointing_steps $CHECKPOINTING_STEPS \
     --save_total_limit $SAVE_TOTAL_LIMIT \
     --max_grad_norm $MAX_GRAD_NORM \
-    --dataset_path $DATASET_PATH \
+    --dataset_paths $DATASET_PATHS \
     --run_name $RUN_NAME

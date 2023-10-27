@@ -1,27 +1,212 @@
-from dataclasses import dataclass, field
 import math
 import os
 import shutil
-from typing import Optional
-
-from datasets import load_from_disk, concatenate_datasets
-from accelerate import Accelerator
-
-from transformers import AutoTokenizer
-from transformers import DataCollatorForLanguageModeling
-from transformers import get_scheduler
-from transformers import (
-    DebertaV2Config,
-    DebertaV2ForMaskedLM,
-    DebertaV2ForTokenClassification,
-    HfArgumentParser,
-)
-
-import torch
-from torch.utils.data import DataLoader
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Union
 
 import srsly
+import torch
+import torch.utils.checkpoint
+from accelerate import Accelerator
+from datasets import concatenate_datasets, load_from_disk
+from torch import nn
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from transformers import (
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    DebertaV2Config,
+    DebertaV2Model,
+    DebertaV2PreTrainedModel,
+    HfArgumentParser,
+    get_scheduler,
+)
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import MaskedLMOutput, TokenClassifierOutput
+
+
+class DebertaV2LMPredictionHead(nn.Module):
+    def __init__(self, config, vocab_size):
+        super().__init__()
+        self.embedding_size = getattr(
+            config, "embedding_size", config.hidden_size
+        )
+        self.dense = nn.Linear(config.hidden_size, self.embedding_size)
+        self.transform_act_fn = (
+            ACT2FN[config.hidden_act]
+            if isinstance(config.hidden_act, str)
+            else config.hidden_act
+        )
+
+        self.LayerNorm = LayerNorm(
+            self.embedding_size, config.layer_norm_eps, elementwise_affine=True
+        )
+
+        self.bias = nn.Parameter(torch.zeros(vocab_size))
+
+    def forward(self, hidden_states, embeding_weight):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.transform_act_fn(hidden_states)
+        # b x s x d
+        hidden_states = self.LayerNorm(hidden_states)
+
+        # b x s x v
+        logits = (
+            torch.matmul(hidden_states, embeding_weight.t().to(hidden_states))
+            + self.bias
+        )
+        return logits
+
+
+class DebertaV2ForMaskedLM(DebertaV2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.deberta = DebertaV2Model(config)
+        self.cls = DebertaV2LMPredictionHead(config, config.vocab_size)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, MaskedLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
+            config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked), the
+            loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`
+        """
+
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
+        )
+
+        outputs = self.deberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+        ebd_weight = self.deberta.embeddings.word_embeddings.weight
+        prediction_scores = self.cls(sequence_output, ebd_weight)
+
+        masked_lm_loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()  # -100 index = padding token
+            masked_lm_loss = loss_fct(
+                prediction_scores.view(-1, self.config.vocab_size),
+                labels.view(-1),
+            )
+
+        if not return_dict:
+            output = (prediction_scores,) + outputs[1:]
+            return (
+                ((masked_lm_loss,) + output)
+                if masked_lm_loss is not None
+                else output
+            )
+
+        return MaskedLMOutput(
+            loss=masked_lm_loss,
+            logits=prediction_scores,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class DebertaV2ForReplacedTokenDetection(DebertaV2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+
+        self.deberta = DebertaV2Model(config)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.transform_act_fn = (
+            ACT2FN[config.hidden_act]
+            if isinstance(config.hidden_act, str)
+            else config.hidden_act
+        )
+        self.LayerNorm = LayerNorm(config.hidden_size, config.layer_norm_eps)
+        self.classifier = nn.Linear(config.hidden_size, 1)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, TokenClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
+        """
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
+        )
+
+        outputs = self.deberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+
+        ctx_states = sequence_output[:, 0, :]
+        seq_states = self.LayerNorm(ctx_states.unsqueeze(-2) + sequence_output)
+        seq_states = self.dense(seq_states)
+        seq_states = self.transform_act_fn(seq_states)
+        logits = self.classifier(seq_states).squeeze(-1)
+
+        loss = None
+        if labels is not None:
+            loss_fct = BCEWithLogitsLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TokenClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 @dataclass
@@ -101,23 +286,24 @@ class TrainArgs:
     )
     dataset_paths: Optional[str] = field(
         default="brwac_encoded_firsthalf,brwac_encoded_secondhalf",
-        metadata={"help": "Path to the dataset"}
+        metadata={"help": "Path to the dataset"},
     )
     run_name: Optional[str] = field(
         default="debertinha-v2-runs",
         metadata={"help": "Name of the run"},
     )
     resume_from_checkpoint: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to the saved state to load"}
+        default=None, metadata={"help": "Path to the saved state to load"}
     )
     skip_batches: Optional[int] = field(
         default=0,
-        metadata={"help": "number of steps to skip from the dataloader"}
+        metadata={"help": "number of steps to skip from the dataloader"},
     )
     delete_keys: Optional[bool] = field(
         default=True,
-        metadata={"help": "Whether to delete the keys from the generator/discriminator weights"}
+        metadata={
+            "help": "Whether to delete the keys from the generator/discriminator weights"
+        },
     )
 
 
@@ -170,12 +356,12 @@ def initialize_generator(targs) -> DebertaV2ForMaskedLM:
 
 def initialize_discriminator(
     targs,
-) -> DebertaV2ForTokenClassification:
+) -> DebertaV2ForReplacedTokenDetection:
     discriminator_config = DebertaV2Config(
         **srsly.read_json(targs.discriminator_config)
     )
     discriminator_config.num_labels = 1
-    discriminator = DebertaV2ForTokenClassification(discriminator_config)
+    discriminator = DebertaV2ForReplacedTokenDetection(discriminator_config)
 
     discriminator_weights = torch.load(
         targs.discriminator_weights, map_location=torch.device("cpu")
@@ -255,7 +441,14 @@ def topk_sampling(logits, topk=1, temp=1):
     return next_tokens, top_p
 
 
-def generator_step(generator, generator_optimizer, generator_lr_scheduler, accelerator, batch, targs):
+def generator_step(
+    generator,
+    generator_optimizer,
+    generator_lr_scheduler,
+    accelerator,
+    batch,
+    targs,
+):
     gen_outputs = generator(**batch)
     gen_loss = gen_outputs.loss
     accelerator.backward(gen_loss)
@@ -270,14 +463,13 @@ def generator_step(generator, generator_optimizer, generator_lr_scheduler, accel
 
     return gen_loss.cpu().detach().float(), gen_outputs.logits
 
+
 def discriminator_batch(gen_logits, batch, targs):
     mlm_labels = batch.pop("labels")
     input_ids = batch.pop("input_ids")
 
     gen_logits = gen_logits.view(-1, gen_logits.size(-1))
-    topk_labels, _ = topk_sampling(
-        gen_logits, topk=1, temp=targs.temperature
-    )
+    topk_labels, _ = topk_sampling(gen_logits, topk=1, temp=targs.temperature)
     mask_index = (mlm_labels.view(-1) > 0).nonzero().view(-1)
     top_ids = torch.zeros_like(mlm_labels.view(-1))
     top_ids.scatter_(
@@ -286,16 +478,22 @@ def discriminator_batch(gen_logits, batch, targs):
         dim=-1,
     )
     top_ids = top_ids.view(mlm_labels.size())
-    new_ids = torch.where(
-        mlm_labels > 0, top_ids, input_ids
-    ).detach()
+    new_ids = torch.where(mlm_labels > 0, top_ids, input_ids).detach()
     return {
         "input_ids": new_ids,
         "labels": mlm_labels,
         "attention_mask": batch.pop("attention_mask"),
     }
 
-def discriminator_step(discriminator, discriminator_optimizer, discriminator_lr_scheduler, accelerator, batch, targs):
+
+def discriminator_step(
+    discriminator,
+    discriminator_optimizer,
+    discriminator_lr_scheduler,
+    accelerator,
+    batch,
+    targs,
+):
     mlm_labels = batch.pop("labels")
     disc_outputs = discriminator(**batch)
 
@@ -305,17 +503,11 @@ def discriminator_step(discriminator, discriminator_optimizer, discriminator_lr_
     input_ids = batch.pop("input_ids")
 
     input_idx = (_input_mask > 0).nonzero().view(-1)
-    mask_labels = (
-        (mlm_labels > 0) & (mlm_labels != input_ids)
-    ).view(-1)
-    mask_labels = torch.gather(
-        mask_labels.to(mask_logits), 0, input_idx
-    )
+    mask_labels = ((mlm_labels > 0) & (mlm_labels != input_ids)).view(-1)
+    mask_labels = torch.gather(mask_labels.to(mask_logits), 0, input_idx)
     mask_loss_fn = torch.nn.BCEWithLogitsLoss()
     mask_logits = torch.gather(mask_logits, 0, input_idx).float()
-    disc_loss = targs.rtd_lambda * mask_loss_fn(
-        mask_logits, mask_labels
-    )
+    disc_loss = targs.rtd_lambda * mask_loss_fn(mask_logits, mask_labels)
     accelerator.backward(disc_loss)
     if accelerator.sync_gradients:
         accelerator.clip_grad_norm_(
@@ -326,6 +518,7 @@ def discriminator_step(discriminator, discriminator_optimizer, discriminator_lr_
     discriminator_optimizer.zero_grad()
 
     return disc_loss.cpu().detach().float()
+
 
 if __name__ == "__main__":
     parser = HfArgumentParser(TrainArgs)
@@ -341,7 +534,9 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(targs.tokenizer_name)
 
-    dataset = concatenate_datasets([load_from_disk(dspath) for dspath in targs.dataset_paths.split(",")])
+    dataset = concatenate_datasets(
+        [load_from_disk(dspath) for dspath in targs.dataset_paths.split(",")]
+    )
 
     train_loader = get_train_dataloader(targs, tokenizer, dataset)
 
@@ -388,7 +583,9 @@ if __name__ == "__main__":
 
     if targs.resume_from_checkpoint is not None:
         accelerator.load_state(targs.resume_from_checkpoint)
-        train_loader = accelerator.skip_first_batches(train_loader, targs.skip_batches)
+        train_loader = accelerator.skip_first_batches(
+            train_loader, targs.skip_batches
+        )
         print("LOADED STATE")
 
     progress_bar = tqdm(
@@ -410,7 +607,14 @@ if __name__ == "__main__":
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(generator, discriminator):
                 ## GENERATOR STEP
-                gen_loss, gen_logits = generator_step(generator, generator_optimizer, generator_lr_scheduler, accelerator, batch, targs)
+                gen_loss, gen_logits = generator_step(
+                    generator,
+                    generator_optimizer,
+                    generator_lr_scheduler,
+                    accelerator,
+                    batch,
+                    targs,
+                )
                 total_generator_loss += gen_loss
                 ## GENERATOR STEP
 
@@ -420,11 +624,18 @@ if __name__ == "__main__":
                 ## DISCRIMINATOR BATCH
 
                 ## DISCRIMINATOR STEP
-                disc_loss = discriminator_step(discriminator, discriminator_optimizer, discriminator_lr_scheduler, accelerator, batch, targs)
+                disc_loss = discriminator_step(
+                    discriminator,
+                    discriminator_optimizer,
+                    discriminator_lr_scheduler,
+                    accelerator,
+                    batch,
+                    targs,
+                )
                 total_discriminator_loss += disc_loss
                 ## DISCRIMINATOR STEP
 
-                total_loss += (gen_loss + disc_loss)
+                total_loss += gen_loss + disc_loss
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
