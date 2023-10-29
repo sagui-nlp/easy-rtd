@@ -368,15 +368,6 @@ def initialize_generator(targs) -> DebertaV2ForMaskedLM:
         for key in delete_keys:
             del generator_weights[key]
 
-        rename_keys = {
-            "lm_predictions.lm_head.dense.weight": "cls.predictions.transform.dense.weight",
-            "lm_predictions.lm_head.dense.bias": "cls.predictions.transform.dense.bias",
-            "lm_predictions.lm_head.LayerNorm.weight": "cls.predictions.transform.LayerNorm.weight",
-            "lm_predictions.lm_head.LayerNorm.bias": "cls.predictions.transform.LayerNorm.bias",
-        }
-        for old_key, new_key in rename_keys.items():
-            generator_weights[new_key] = generator_weights.pop(old_key)
-
     print(generator.load_state_dict(generator_weights, strict=False))
 
     return generator
