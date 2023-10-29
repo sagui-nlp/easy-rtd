@@ -333,6 +333,9 @@ class TrainArgs:
             "help": "Whether to delete the keys from the generator/discriminator weights"
         },
     )
+    logging_steps: Optional[int] = field(
+        default=100, metadata={"help": "Logging steps"}
+    )
 
 
 def get_train_dataloader(targs, tokenizer, dataset):
@@ -672,14 +675,15 @@ if __name__ == "__main__":
                         old_state = saved_states.pop(0)
                         shutil.rmtree(old_state)
 
-                if completed_steps % 100 == 0:
+                if completed_steps % targs.logging_steps == 0:
                     accelerator.log(
                         {
-                            "train_loss": total_loss.item() / 100,
+                            "train_loss": total_loss.item()
+                            / targs.logging_steps,
                             "discriminator_loss": total_discriminator_loss.item()
-                            / 100,
+                            / targs.logging_steps,
                             "generator_loss": total_generator_loss.item()
-                            / 100,
+                            / targs.logging_steps,
                             "epoch": epoch,
                             "step": completed_steps,
                         },
