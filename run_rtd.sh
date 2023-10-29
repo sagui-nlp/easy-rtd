@@ -2,9 +2,9 @@
 
 # Set the paths to the generator and discriminator files
 GENERATOR_CONFIG="deberta-v3-xsmall-changed/generator_config.json"
-GENERATOR_WEIGHTS="deberta-v3-xsmall-changed/pytorch_model.generator.bin"
+GENERATOR_WEIGHTS="deberta-v3-xsmall-changed/generator_3_epochs.bin"
 DISCRIMINATOR_CONFIG="deberta-v3-xsmall-changed/config.json"
-DISCRIMINATOR_WEIGHTS="deberta-v3-xsmall-changed/pytorch_model.bin"
+DISCRIMINATOR_WEIGHTS="deberta-v3-xsmall-changed/discriminator_3_epochs.bin"
 
 # Run arguments
 LOG_WITH="tensorboard"
@@ -15,7 +15,7 @@ RUN_NAME="debertinha-v2-runs"
 DATASET_PATHS="ds_subset_encoded"
 
 # Set the training arguments
-TOKENIZER_NAME="debertinha-v2-tokenizer"
+TOKENIZER_NAME="deberta-v3-xsmall-changed"
 BATCH_SIZE=1
 TEMPERATURE=1.0
 RTD_LAMBDA=20.0
@@ -23,7 +23,7 @@ LEARNING_RATE=5e-5
 WEIGHT_DECAY=0.0
 MIXED_PRECISION="no"
 NUM_WARMUP_STEPS=10000
-GRADIENT_ACCUMULATION_STEPS=1
+GRADIENT_ACCUMULATION_STEPS=2
 LR_SCHEDULER_TYPE="linear"
 NUM_TRAIN_EPOCHS=1
 CPU=false

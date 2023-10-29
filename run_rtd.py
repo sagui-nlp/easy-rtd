@@ -59,12 +59,22 @@ class DebertaV2LMPredictionHead(nn.Module):
         return logits
 
 
+class LMHead(nn.Module):
+    def __init__(self, config, vocab_size):
+        super().__init__()
+        self.lm_head = DebertaV2LMPredictionHead(config, vocab_size)
+
+    def forward(self, *args, **kwawrgs):
+        logits = self.lm_head(*args, **kwawrgs)
+        return logits
+
+
 class DebertaV2ForMaskedLM(DebertaV2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
         self.deberta = DebertaV2Model(config)
-        self.cls = DebertaV2LMPredictionHead(config, config.vocab_size)
+        self.lm_predictions = LMHead(config, config.vocab_size)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -107,7 +117,7 @@ class DebertaV2ForMaskedLM(DebertaV2PreTrainedModel):
 
         sequence_output = outputs[0]
         ebd_weight = self.deberta.embeddings.word_embeddings.weight
-        prediction_scores = self.cls(sequence_output, ebd_weight)
+        prediction_scores = self.lm_predictions(sequence_output, ebd_weight)
 
         masked_lm_loss = None
         if labels is not None:
@@ -133,12 +143,9 @@ class DebertaV2ForMaskedLM(DebertaV2PreTrainedModel):
         )
 
 
-class DebertaV2ForReplacedTokenDetection(DebertaV2PreTrainedModel):
+class MaskPredictions(nn.Module):
     def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-
-        self.deberta = DebertaV2Model(config)
+        super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.transform_act_fn = (
             ACT2FN[config.hidden_act]
@@ -147,6 +154,32 @@ class DebertaV2ForReplacedTokenDetection(DebertaV2PreTrainedModel):
         )
         self.LayerNorm = LayerNorm(config.hidden_size, config.layer_norm_eps)
         self.classifier = nn.Linear(config.hidden_size, 1)
+
+    def forward(self, sequence_output):
+        ctx_states = sequence_output[:, 0, :]
+        seq_states = self.LayerNorm(ctx_states.unsqueeze(-2) + sequence_output)
+        seq_states = self.dense(seq_states)
+        seq_states = self.transform_act_fn(seq_states)
+        logits = self.classifier(seq_states).squeeze(-1)
+        return logits
+
+
+class DebertaV2ForReplacedTokenDetection(DebertaV2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+
+        self.deberta = DebertaV2Model(config)
+        self.mask_predictions = MaskPredictions(config)
+
+        word_bias = torch.zeros_like(
+            self.deberta.embeddings.word_embeddings.weight
+        )
+        word_bias = torch.nn.Parameter(word_bias)
+        delattr(self.deberta.embeddings.word_embeddings, "weight")
+        self.deberta.embeddings.word_embeddings.register_parameter(
+            "_weight", word_bias
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -185,12 +218,7 @@ class DebertaV2ForReplacedTokenDetection(DebertaV2PreTrainedModel):
         )
 
         sequence_output = outputs[0]
-
-        ctx_states = sequence_output[:, 0, :]
-        seq_states = self.LayerNorm(ctx_states.unsqueeze(-2) + sequence_output)
-        seq_states = self.dense(seq_states)
-        seq_states = self.transform_act_fn(seq_states)
-        logits = self.classifier(seq_states).squeeze(-1)
+        logits = self.mask_predictions(sequence_output)
 
         loss = None
         if labels is not None:
@@ -216,7 +244,7 @@ class TrainArgs:
         metadata={"help": "Path to the generator config file."},
     )
     generator_weights: Optional[str] = field(
-        default="deberta-v3-xsmall-changed/pytorch_model.generator.bin",
+        default="deberta-v3-xsmall-changed/generator_3_epochs.bin",
         metadata={"help": "Path to the generator weights file."},
     )
     discriminator_config: Optional[str] = field(
@@ -224,7 +252,7 @@ class TrainArgs:
         metadata={"help": "Path to the discriminator config file."},
     )
     discriminator_weights: Optional[str] = field(
-        default="deberta-v3-xsmall-changed/pytorch_model.bin",
+        default="deberta-v3-xsmall-changed/discriminator_3_epochs.bin",
         metadata={"help": "Path to the discriminator weights file."},
     )
     per_device_train_batch_size: Optional[int] = field(
@@ -387,7 +415,7 @@ def _set_param(module, param_name, value):
 def disentangled_hook(module, *inputs):
     g_w_ebd = generator.deberta.embeddings.word_embeddings
     d_w_ebd = discriminator.deberta.embeddings.word_embeddings
-    _set_param(d_w_ebd, "weight", g_w_ebd.weight.detach() + d_w_ebd.weight)
+    _set_param(d_w_ebd, "weight", g_w_ebd.weight.detach() + d_w_ebd._weight)
 
 
 def get_optimizer_and_scheduler(model, targs):
